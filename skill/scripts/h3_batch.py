@@ -188,11 +188,21 @@ def submit_workflow(comfy, wf, client_id):
 
 
 def poll_history(comfy, pid, deadline_s=POLL_DEADLINE_S):
+    """Returns (image_meta | None, lost: bool). lost=True means the task vanished
+    from history (instance restart wiped it) — no point waiting out the deadline."""
     t0 = time.time()
+    notfound = 0
     while time.time() - t0 < deadline_s:
         time.sleep(POLL_INTERVAL_S)
         try:
             h = http_json(f"{comfy}/history/{pid}", is_get=True, retries=2)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                notfound += 1
+                if notfound >= 5:   # ~1min of consistent 404 = task lost
+                    return None, True
+                continue
+            continue
         except Exception:
             continue
         info = h.get(pid) or {}
@@ -201,12 +211,12 @@ def poll_history(comfy, pid, deadline_s=POLL_DEADLINE_S):
             for nid, o in info.get("outputs", {}).items():
                 for im in o.get("images", []):
                     if im.get("type") == "output" and im["filename"].endswith(".mp4"):
-                        return im
-            return None
+                        return im, False
+            return None, False
         if st == "error":
             msg = info.get("status", {}).get("messages", [])
             raise RuntimeError(f"comfy error: {json.dumps(msg)[:300]}")
-    return None  # timeout
+    return None, False  # timeout
 
 
 def download(comfy, im, dest):
@@ -247,15 +257,17 @@ def cmd_submit(args):
     else:
         if not args.job:
             raise SystemExit("need --prompt or --prompt-file (or --job to resume)")
-    # resume semantics: default to full ledger length so every old task is revisited;
-    # a fresh run defaults to the prompt count. --count always overrides.
+    # resume semantics: failed tasks must reuse THEIR OWN original prompt from
+    # the ledger (round-robin over a new prompt file would mis-assign prompts).
+    # New prompts only apply when explicitly given AND the task has no ledger entry.
+    if args.job:
+        orig_prompts = {e["id"]: e.get("prompt") or "" for e in ledger}
+        if not prompts:
+            prompts = [e.get("prompt") or "" for e in ledger]
     count = args.count or (len(ledger) if args.job else len(prompts))
     if args.job and args.count is None and prompts and len(prompts) != len(ledger):
         print(f"NOTE: resume with {len(prompts)} prompts but ledger has {len(ledger)} tasks; "
-              f"existing done tasks keep their ORIGINAL prompts (only failed ones rerun with new prompt)")
-    # on resume without explicit prompts, reuse the ledger's own prompts
-    if args.job and not prompts:
-        prompts = [e.get("prompt") or "" for e in ledger]
+              f"failed tasks rerun with their ORIGINAL prompts from the ledger")
 
     ref_node_ids = []
     r2v_names = []
@@ -280,22 +292,36 @@ def cmd_submit(args):
     inflight = {}  # entry_id -> prompt_id (submitted, awaiting result)
 
     def settle(entry):
-        """Poll one inflight task to completion, download, update ledger."""
+        """Poll one inflight task to completion, download, update ledger.
+        Distinguishes generation failure (rerun costs GPU) from download
+        failure (rerun is free — history still has the result)."""
         pid = inflight.pop(entry["id"])
         try:
-            im = poll_history(comfy, pid)
-            if im:
-                dest = os.path.join(jd, "raw", f"{entry['id']}_seed{entry['seed']}.mp4")
+            im, lost = poll_history(comfy, pid)
+            if im is None:
+                entry["status"] = "lost (task vanished)" if lost else "timeout"
+                print(f"        -> {entry['status']} (retryable)")
+                return
+            dest = os.path.join(jd, "raw", f"{entry['id']}_seed{entry['seed']}.mp4")
+            entry["result_meta"] = im  # keep for download-only retry
+            try:
                 download(comfy, im, dest)
                 entry.update(status="ok", file=dest,
                              size_mb=round(os.path.getsize(dest) / 1048576, 2))
                 print(f"        -> ok {entry['size_mb']}MB")
-            else:
-                entry["status"] = "timeout"
-                print("        -> timeout (retryable)")
+            except Exception as de:
+                # generation SUCCEEDED; only the download failed. Retrying just
+                # the download is free — mark accordingly so retry doesn't regenerate.
+                entry["status"] = f"download_error: {str(de)[:120]}"
+                print(f"        -> {entry['status']} (result kept in history)")
         except Exception as e:
             entry["status"] = f"error: {str(e)[:150]}"
             print(f"        -> {entry['status']}")
+
+    # resume of an empty ledger without prompts is a no-op — say so instead of
+    # silently exiting with count=0
+    if args.job and not ledger and not prompts:
+        raise SystemExit(f"job {jd} has an empty ledger and no --prompt/--prompt-file given; nothing to resume")
 
     for i in range(count):
         entry_id = f"task{i+1:03d}"
@@ -307,8 +333,11 @@ def cmd_submit(args):
         if entry_id in done_ids:
             print(f"[{i+1}/{count}] {entry_id} -> skip (done)")
             continue
-        p = prompts[i % len(prompts)] if prompts else None
+        # resume: failed/lost tasks keep their own original prompt
+        p = orig_prompts.get(entry_id) if (args.job and entry_id in orig_prompts) else None
         if p is None:
+            p = prompts[i % len(prompts)] if prompts else None
+        if not p:
             print(f"[{i+1}/{count}] {entry_id} -> no prompt available, stop")
             break
         seed = random.randint(1, 2**31 - 1) if args.seed == "auto" else int(args.seed) + i
@@ -365,8 +394,10 @@ def classify(status):
         return "fatal"      # bad workflow params: retrying won't help
     if "comfy error" in s:
         return "retryable"  # execution-stage failure (often transient)
-    if s == "timeout":
+    if s == "timeout" or s.startswith("lost"):
         return "retryable"  # instance restart / queue loss
+    if s.startswith("download_error"):
+        return "retryable"  # generation succeeded; only the download needs redoing
     return "retryable"      # network errors etc.
 
 
@@ -384,7 +415,7 @@ def cmd_status(args):
     print(f"job {args.job}: {dict(c)}")
     for e in rows:
         print(f"  {e['id']} {e['status']:10s} [{e['class']}] {e['size_mb'] or '-'}MB "
-              f"{'2K✓' if e['2k'] else ''}")
+              f"{'[2K]' if e['2k'] else ''}")
 
 
 def cmd_retry(args):
@@ -409,6 +440,20 @@ def cmd_retry(args):
     print(f"retrying {len(targets)} task(s)")
     client_id = uuid.uuid4().hex
     for e in targets:
+        # download_error fast path: the generation result is still in history —
+        # just re-download it, don't burn GPU regenerating.
+        if str(e["status"]).startswith("download_error") and e.get("result_meta"):
+            try:
+                dest = os.path.join(args.job, "raw", f"{e['id']}_seed{e['seed']}.mp4")
+                download(comfy, e["result_meta"], dest)
+                e.update(status="ok", file=dest,
+                         size_mb=round(os.path.getsize(dest) / 1048576, 2))
+                print(f"  {e['id']} -> re-downloaded only {e['size_mb']}MB (no GPU cost)")
+            except Exception as de:
+                e["status"] = f"download_error: {str(de)[:120]}"
+                print(f"  {e['id']} -> download failed again: {str(de)[:80]}")
+            save_job(args.job, ledger)
+            continue
         # restore original spec from the ledger; CLI flags only override when set
         res = args.resolution or e.get("resolution") or "768p"
         dur = args.duration or e.get("duration") or 5
@@ -419,7 +464,7 @@ def cmd_retry(args):
             e["prompt_id"] = pid
             e["status"] = "running"
             save_job(args.job, ledger)
-            im = poll_history(comfy, pid)
+            im, _lost = poll_history(comfy, pid)
             if im:
                 dest = os.path.join(args.job, "raw", f"{e['id']}_seed{e['seed']}.mp4")
                 download(comfy, im, dest)
@@ -442,10 +487,11 @@ def cmd_upscale(args):
     vsr = args.vsr.rstrip("/")
     http_json(vsr + "/healthz", is_get=True)
     ledger = load_job(args.job)
-    raw_ok = [e for e in ledger if e["status"] == "ok" and e.get("file")]
-    pending = [e for e in raw_ok if not e.get("upscaled")]
-    if len(raw_ok) < len([e for e in ledger if e["status"] == "ok"]):
-        print("WARN: some tasks not ok yet; upscaling completed ones only")
+    pending = [e for e in ledger if e["status"] == "ok" and e.get("file")
+               and not e.get("upscaled")]
+    n_not_ok = sum(1 for e in ledger if e["status"] != "ok")
+    if n_not_ok:
+        print(f"NOTE: {n_not_ok} task(s) not ok yet; upscaling completed ones only")
     for e in pending:
         body, boundary = multipart_body(
             {"scale": str(args.scale), "quality": args.quality,
@@ -480,7 +526,7 @@ def cmd_upscale(args):
 
 def suanli_pause(task_id):
     """Pause a deployment via Open API (reads SUANLI_TOKEN from env)."""
-    token = os.environ.get("SUANLI_TOKEN")
+    token = (os.environ.get("SUANLI_TOKEN") or "").strip()
     if not token:
         return {"error": "SUANLI_TOKEN not set; pause manually via console or skill api/deployment.md"}
     url = "https://openapi.suanli.cn/api/deployment/task/pause"

@@ -42,6 +42,9 @@ def test_classify():
     check("classify net error -> retryable",
           hb.classify("error: <urlopen error timed out>") == "retryable")
     check("classify running -> retryable", hb.classify("running") == "retryable")
+    check("classify lost -> retryable", hb.classify("lost (task vanished)") == "retryable")
+    check("classify download_error -> retryable",
+          hb.classify("download_error: timed out") == "retryable")
 
 
 def test_workflow_modes():
