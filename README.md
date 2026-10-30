@@ -6,7 +6,7 @@
 
 - 遵循 [suanli.cn Agent Skills 规范](https://docs.suanli.cn/skills)，与官方 [gongji-skills](https://github.com/suanleme/gongji-skills) 同构
 - 实现组织参考 [open-source-video-gen-skill](https://github.com/mini-yifan/open-source-video-gen-skill)（Vibe Video）
-- 四种模式（文生 / 图生 / 参考生 / 2K 超分）全部真机验证，28 项回归测试
+- 四种模式（文生 / 图生 / 参考生 / 2K 超分）全部真机验证，30 项回归测试
 
 ## 为什么是它
 
@@ -109,7 +109,7 @@ suanli-h3-video/
     scripts/
       h3_batch.py         批量执行器（submit/status/retry/upscale/done）
     tests/
-      test_h3_batch.py    28 项回归测试（python tests/test_h3_batch.py）
+      test_h3_batch.py    30 项回归测试（python tests/test_h3_batch.py）
     examples/
       README.md           7 个可复制示例
   docs/
